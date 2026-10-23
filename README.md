@@ -1,1 +1,257 @@
 # InfraTicket
+A departmental ticketing and escalation management system. Tickets are routed to teams, tracked against SLA targets, escalated when they stall, and mirrored into the tools your team already uses.
+
+Accounts are created by administrators. There is no public sign-up — the only exception is the one-time setup screen that creates the very first administrator on a brand-new database.
+
+Before exposing this on a public URL, set SETUP_TOKEN. Setup is open by default, which is right for local and internal use, but on a public address the first person to load the page claims the administrator account. See SECURITY.md.
+
+Quick start
+Requires Node.js 20.11 or newer. Nothing else.
+
+npm install
+npm run seed     # optional: demo teams, people, and tickets
+npm run dev
+Open http://localhost:3000.
+
+If you skipped the seed, the setup screen asks you to create the first administrator account.
+If you ran the seed, sign in as avery@example.com / ChangeMe123!. Six other demo accounts share that password; npm run seed prints them all.
+There is no database to install and no configuration to write. The app creates an embedded SQLite database under data/ on first boot.
+
+To start over: npm run reset.
+
+Running in production
+npm run build
+npm start
+npm run build produces dist/client (the React bundle) and dist/server/index.mjs (the API). npm start serves both from one process on one port.
+
+Docker
+# App + PostgreSQL
+docker compose up -d
+
+# App alone, on the embedded SQLite database
+docker compose up -d app
+MySQL
+MySQL 8.0.13+ or MariaDB 10.2+, created as utf8mb4:
+
+DATABASE_URL=mysql://infraticket:pass@127.0.0.1:3306/infraticket npm start
+The schema is created on first boot. For a full internal deployment behind Apache, see the MySQL and Apache runbook in DEPLOY.md.
+
+PostgreSQL
+Set DATABASE_URL and restart. The schema is created automatically:
+
+DATABASE_URL=postgresql://user:pass@host:5432/escalation_pro npm start
+Both engines run the same schema and the same test suite. SQLite suits a single instance; use PostgreSQL when you need several instances or an external backup story.
+
+Putting it on your own domain (Cloudflare)
+This is a Node server with a native SQLite module, disk-backed uploads, and a background job. It does not run on Cloudflare Workers — Workers have no filesystem, cannot load native addons, and are request-scoped. Running it there would mean replacing the database, upload storage, HTTP layer, and scheduler.
+
+The supported way to serve it on a Cloudflare domain is a Cloudflare Tunnel, which proxies to the Node server and needs no code changes:
+
+In Cloudflare Zero Trust → Networks → Tunnels, create a tunnel.
+Add a public hostname (e.g. tickets.yourdomain.com) pointing at http://app:3000.
+Copy the tunnel token into .env:
+CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi...
+SETUP_TOKEN=$(openssl rand -hex 16)     # required before going public
+SESSION_COOKIE_SECURE=true              # the tunnel terminates TLS
+APP_URL=https://tickets.yourdomain.com
+Start it:
+docker compose --profile tunnel up -d
+No firewall port is opened and no DNS record is edited by hand. Put Cloudflare Access in front of the hostname if you want SSO or MFA.
+
+Serverless (Vercel)
+See DEPLOY.md for the full walkthrough.
+
+The app also runs as a single serverless function, with vercel.json and api/index.ts already wired up. Two things change automatically in that mode:
+
+A Postgres database is required. DATABASE_URL must be set; the embedded SQLite file needs a persistent filesystem that serverless platforms do not have, so the app refuses to start rather than silently losing data. Use a pooled connection string — serverless creates many short-lived instances, and a direct connection will exhaust the database's connection limit.
+Attachments move into the database. With no persistent disk, bytes are stored in Postgres (capped at 6MB per file) instead of on the filesystem. Override with ATTACHMENT_STORE=disk|database.
+The SLA sweep has no long-running process to live in, so it runs on a schedule instead: vercel.json declares an hourly cron that calls /api/cron/sla, authorised with CRON_SECRET.
+
+Required environment variables: DATABASE_URL, SESSION_SECRET, SECRET_KEY, CRON_SECRET, SETUP_TOKEN, and SESSION_COOKIE_SECURE=true.
+
+Hosted deployment
+render.yaml provisions a web service and a managed PostgreSQL database. Point Render at this repository as a Blueprint and it deploys as-is. You can then point Cloudflare DNS at the Render hostname.
+
+Set SESSION_COOKIE_SECURE=true behind any HTTPS proxy. Leave it false on plain HTTP, or browsers will refuse the session cookie and nobody can sign in.
+
+See .env.example for every supported variable. All of them are optional.
+
+How it works
+Tickets
+Each ticket carries a reference (ESC-1042), a status, a priority, a type, an owning team, an assignee, and a full timeline of comments and system events.
+
+Status	Meaning
+open	Raised, not yet being worked
+in_progress	Someone is actively on it
+pending	Blocked, usually waiting on a third party
+resolved	Fixed, awaiting confirmation
+closed	Finished
+Priorities are urgent, high, normal, and low. Types are incident, request, question, problem, and escalation.
+
+Comments are either public replies or internal notes, which are hidden from anyone without the internal-notes permission and are never sent to Slack, Microsoft Teams, or Linear.
+
+Routing
+Each team chooses how new tickets find an owner:
+
+Manual — the ticket stays unassigned until someone picks it up.
+Round robin — each new ticket goes to the next member in turn.
+Least busy — whichever member has the fewest open tickets.
+Only active members with the agent role or above are eligible. Viewers never receive work.
+
+SLA
+Teams set a first-response target and a resolution target. The due date is derived from the resolution target, scaled by priority:
+
+Priority	Multiplier
+Urgent	×0.25
+High	×0.5
+Normal	×1
+Low	×2
+A team with a 24-hour resolution target therefore gives an urgent ticket six hours. A background job scans for breaches every five minutes and notifies watchers once per breach.
+
+The first-response clock stops on the first public reply from someone other than the requester.
+
+Escalation
+Escalating a ticket raises its level, bumps its priority, records the reason as an internal note, and notifies every connected channel. Above the configured priority floor it can also open a tracked issue in Linear.
+
+Roles and permissions
+Role	Intended for
+Administrator	Full access, including integrations, settings, and the audit log
+Manager	Runs queues and people; everything except integrations and system settings
+Agent	Works tickets in their assigned teams
+Viewer	Read-only access to tickets in their assigned teams
+Individual permissions can be granted on top of a role from the People page. A role's own permissions cannot be revoked — change the role instead.
+
+Users without tickets.view_all see only tickets in their teams, plus any ticket they raised, were assigned, or created.
+
+The API enforces every permission independently of the UI. Hiding a button is a convenience, not the security boundary.
+
+Integrations
+Configure these in Integrations while signed in as an administrator. Every credential is encrypted with AES-256-GCM before it is stored, and each provider has a Test connection button that calls the real service and reports exactly what came back.
+
+Not every provider can carry traffic in both directions. What each one actually supports:
+
+Raise a ticket	Notifications out	Reply to a ticket	Change its status
+Slack (bot)	/gml finance opens the form	yes	yes, in the ticket's thread	yes, buttons, a reply starting "Fixed", or a ✅
+Slack (webhook)	no	yes	no — a webhook cannot receive	no
+Teams (bot)	@Service Desk finance posts the form	yes	yes, in the ticket's thread	via the link on the card
+Teams (webhook)	no	yes	no	no
+Linear	raise an issue in a mapped team	yes, as a mirrored issue	yes, comments sync both ways	yes, moving the issue, or a comment starting "Fixed"
+Email	no	yes	no	no
+The form each one opens is the department's own form — the questions configured under Teams → Intake form, not a generic three fields. Answers are validated against the real field definitions on the way in, whichever tool they were typed into, because a chat submission is an HTTP request and can claim anything.
+
+Each platform's way in is the idiomatic one for that platform, which is not the same shape in all three:
+
+Slack has real slash commands, so /gml is one. It takes the department as an argument rather than registering /gml-finance, /gml-hr and so on: Slack commands are fixed in the app manifest and cannot be wildcarded, so a command per department would mean editing the Slack app and reinstalling it every time somebody adds a department. With one command, a department added in the admin UI works immediately.
+Teams has no slash commands for third-party apps. Typing / opens Teams' own palette, not ours. Mentioning the bot is the equivalent, and the command list in the app manifest is what makes it discoverable.
+Linear has no user-invocable commands for third-party apps at all. The equivalent is raising an issue the normal way in a Linear team mapped to a department.
+Teams needs a real bot for any of this — an Azure app registration, a Bot Service resource and an app package. An incoming webhook is a URL you post to and Microsoft provides no callback on one, so in webhook mode Teams stays one-way. See deploy/teams/README.md.
+
+Slack
+Either method works:
+
+Incoming webhook — create one at Slack → Your apps → Incoming Webhooks, then paste the https://hooks.slack.com/services/... URL.
+Bot token — create an app with the chat:write scope, then supply the xoxb-... token and a channel. This lets you change channel later without a new URL.
+Messages are sent as Block Kit, with a priority-coloured bar and a button that opens the ticket.
+
+With a bot token, Slack can also send work back:
+
+Replies. Each ticket gets one thread, and anything typed in that thread becomes a public comment on the ticket. Set the signing secret, point Slack → Event Subscriptions at https://your-host/api/webhooks/slack, and subscribe to message.channels. Add the users:read and users:read.email scopes so replies are attributed to the right person.
+Resolving by replying. A thread reply that starts with resolved, fixed, done, sorted, completed or closed (or with ✅) is kept as a comment and resolves the ticket. So does adding a ✅ reaction to the ticket's message or to a reply in its thread — for that, also subscribe to reaction_added and add the reactions:read scope. Questions never count: "fixed?" and "have you fixed it?" are just comments. The same permission check as the buttons applies; anyone else is told privately that the ticket was left alone.
+Resolve, Close and Reopen. Each message carries buttons. Turn on Slack → Interactivity & Shortcuts and point it at https://your-host/api/webhooks/slack/interactive.
+Raising tickets. Add a slash command /gml pointing at https://your-host/api/webhooks/slack/commands. /gml finance opens Finance's own intake form as a modal; /gml asks which department first, and switching the picker rebuilds the form around the new department without losing what has already been typed. The department name is matched forgivingly — finance, Finance, gml-finance and fin all work.
+The whole app can be created from deploy/slack/manifest.yml rather than clicking through the settings: Slack API → Your apps → Create New App → From an app manifest.
+
+A click is only honoured when the clicker's Slack email matches an active account here that holds the Update tickets permission — the buttons are visible to everyone in the channel, so the click itself proves nothing. A refused click is answered privately and changes nothing. Every accepted one is written to the audit trail against the person who made it.
+
+Microsoft Teams
+Two modes, and they are not equivalent.
+
+Bot (two-way). Needs an Azure app registration, an Azure Bot resource whose messaging endpoint is https://your-host/api/webhooks/msteams, and the app package installed into the tenant. Step-by-step in deploy/teams/README.md.
+
+You do not assemble the package by hand. Once the app id and secret are saved, Integrations → Microsoft Teams → Download the app package gives you infrabot-teams.zip — manifest and both icons, carrying this deployment's app id and host and a command menu listing your actual departments. Upload it in Teams under Apps → Manage your apps → Upload an app. There is a CLI for builds that happen before the app is running:
+
+npm run build:teams-app -- --app-id <guid> --url https://tickets.example.internal \
+  --name InfraBot --departments finance,hr,it
+Once it is installed in a channel:
+
+@Service Desk finance posts Finance's intake form as an Adaptive Card.
+@Service Desk lists the departments.
+Ticket updates arrive in that channel, threaded one thread per ticket.
+Replying in a ticket's thread adds a comment to that ticket.
+The endpoint must be reachable by Microsoft, with a certificate Microsoft trusts. An internal CA that only your own machines trust will not do: Microsoft is the client here and is not on your network.
+
+A click or a mention is only honoured when the Teams account's email matches an active user here with the right permission — anyone in the channel can type, so the message itself proves nothing. Set a tenant id to refuse activities from any other Microsoft tenant even when Microsoft signed them.
+
+Incoming webhook (one-way). In Teams: channel → ⋯ → Workflows → Post to a channel when a webhook request is received. Paste the generated URL. Notifications only — see the table above.
+
+Microsoft is retiring the older Office 365 connectors in favour of Workflows, and the two accept different payloads. InfraTicket detects which one your URL needs from its host and sends an Adaptive Card or a MessageCard accordingly. You can override the choice if detection gets it wrong.
+
+Linear
+Create a personal API key at Linear → Settings → API, then choose the Linear team that mirrored issues should be filed against.
+
+Ticket priority maps onto Linear's scale (urgent → 1, high → 2, and so on).
+The issue description links back to the ticket, and public replies are mirrored as Linear comments.
+Comments typed on the Linear issue come back as comments on the ticket, and the requester is told. A comment starting with resolved, fixed, done (the same words as Slack) also resolves the ticket, when the Linear user's email matches an account here with the Update tickets permission. Tick Comments as well as Issues on the Linear webhook for this.
+Set a webhook secret and point a Linear webhook at https://your-host/api/webhooks/linear to sync issue status back. Deliveries are verified with an HMAC-SHA256 signature; unsigned requests are rejected.
+An issue raised in Linear becomes a ticket here, in the department mapped to that Linear team under Teams → Routing. An issue in an unmapped team is left alone rather than dumped into a queue nobody is watching, and an issue this app created never comes back as a second ticket.
+Email (SMTP)
+Standard SMTP with STARTTLS on port 587 or implicit TLS on port 465. Notifies the assignee, the requester, and anyone watching the ticket.
+
+Delivery log
+Every outbound notification is recorded with its status code and any error, and the last 60 are shown at the bottom of the Integrations page. An integration failure never blocks a ticket update — it is logged and the update proceeds.
+
+Reports
+The Reports page covers open and overdue volume, workload per assignee and per team, created-versus-resolved volume over time, average first response, average resolution, and SLA compliance.
+
+Export XLSX produces a real workbook with three sheets — Tickets, Comments, and History — scoped to the selected window and to what you have permission to see.
+
+Project layout
+server/
+  index.ts              Express app, middleware, static serving
+  config.ts             Environment and paths
+  bootstrap.ts          First-administrator creation
+  permissions.ts        Roles and the permission catalogue
+  db/
+    driver.ts           SQLite and PostgreSQL drivers behind one interface
+    schema.ts           Portable schema, applied on boot
+    seed.ts             Demo data
+  routes/               One module per resource
+  repositories/         Data access
+  integrations/         Slack, Microsoft Teams, Linear, SMTP, dispatcher
+  jobs/sla-monitor.ts   Periodic breach detection
+shared/types.ts         Types shared by the API and the client
+src/                    React client (Vite, Tailwind, React Router)
+Scripts
+Command	Does
+npm run dev	Dev server with hot reload on one port
+npm run build	Build the client and the server
+npm start	Run the production build
+npm run seed	Load demo data (no-op if users already exist)
+npm run reset	Delete the local database and re-seed
+npm run typecheck	Type-check client and server
+Security
+SECURITY.md covers the threat model, the test suites, and the known limitations. In short:
+
+Passwords are hashed with scrypt (N=16384) and a per-user salt.
+Sessions live in the database, not in process memory, so they survive restarts and work across multiple instances. The session ID is rotated on sign-in to prevent fixation.
+Suspending a user, deleting them, or resetting their password ends their sessions immediately. Changing your own password ends your other sessions but keeps the one you are using.
+Integration credentials are encrypted at rest and are never returned to the browser — the UI receives only a masked preview.
+Uploads are restricted to an allow-list of types, stored under generated names, and served with X-Content-Type-Options: nosniff. SVGs are always sent as downloads rather than rendered inline.
+The system refuses to remove or demote the last active administrator.
+Every privileged action is written to an append-only audit log with the actor, a summary, and the source IP.
+Login is rate limited (5 failures per account, 30 per IP, per 15 minutes) and does not leak which accounts exist through response timing.
+All SQL is parameterised; admin-configurable webhook URLs are checked against private and link-local address ranges before they are saved.
+Troubleshooting
+Port 3000 is in use — start with PORT=3001 npm run dev.
+
+Signing in does nothing, or the session drops immediately — almost always SESSION_COOKIE_SECURE=true on a plain-HTTP origin. Set it to false unless you are behind HTTPS.
+
+"Could not connect to PostgreSQL" — the message includes the underlying reason. Unset DATABASE_URL to fall back to SQLite and confirm the rest of the app works first.
+
+An integration test fails — the error text comes straight from the provider. invalid_token means the credential is wrong; a timeout usually means egress to that host is blocked.
+
+"That setup token is not correct" — SETUP_TOKEN is set in the environment and must be entered on the setup screen. Read it from your .env or container config; clear the variable and restart if you want setup open.
+
+Locked out by the login rate limit — wait out the window shown in the error (15 minutes), or clear the counter with DELETE FROM login_attempts WHERE key LIKE 'account:%';.
+
+Lost the only administrator password — stop the app, set BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD, and start it against an empty database; or reset the password directly in the users table.
